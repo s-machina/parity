@@ -26,10 +26,6 @@ module Parity
       end
     end
 
-    def open
-      run_via_cli
-    end
-
     def run_via_cli
       Kernel.exec("heroku", subcommand, *arguments, "--remote", environment)
     end
@@ -161,7 +157,7 @@ module Parity
         git diff --quiet #{environment}/master..#{compare_with} -- db/migrate
       })
     end
-    
+
     def compare_with
       if production?
         "master"

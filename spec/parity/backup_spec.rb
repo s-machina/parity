@@ -1,9 +1,10 @@
 require File.join(File.dirname(__FILE__), '..', '..', 'lib', 'parity')
 
 describe Parity::Backup do
+  before { allow(Kernel).to receive(:system) }
+
   it "restores backups to development (after dropping the development DB)" do
     allow(IO).to receive(:read).and_return(database_fixture)
-    allow(Kernel).to receive(:system)
     allow(Etc).to receive(:nprocessors).and_return(number_of_processes)
 
     Parity::Backup.new(from: "production", to: "development").restore
@@ -23,8 +24,6 @@ describe Parity::Backup do
   end
 
   it "restores backups to staging from production" do
-    allow(Kernel).to receive(:system)
-
     Parity::Backup.new(from: "production", to: "staging").restore
 
     expect(Kernel).
@@ -34,7 +33,6 @@ describe Parity::Backup do
 
   it "restores backups to staging from development" do
     allow(IO).to receive(:read).and_return(database_fixture)
-    allow(Kernel).to receive(:system)
 
     Parity::Backup.new(from: "development", to: "staging").restore
 
@@ -44,8 +42,6 @@ describe Parity::Backup do
   end
 
   it "passes additional arguments to the subcommand" do
-    allow(Kernel).to receive(:system)
-
     Parity::Backup.new(
       from: "production",
       to: "staging",
@@ -58,10 +54,6 @@ describe Parity::Backup do
 
   def database_fixture
     IO.read(fixture_path("database.yml"))
-  end
-
-  def database_with_erb_fixture
-    IO.read(fixture_path("database_with_erb.yml"))
   end
 
   def fixture_path(filename)

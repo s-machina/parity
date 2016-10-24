@@ -6,24 +6,40 @@ RSpec.describe Parity::Environment do
     allow(Kernel).to receive(:system).and_return(true)
   end
 
-  it "passes through arguments with correct quoting" do
-    Parity::Environment.new(
-      "production",
-      ["pg:psql", "-c", "select count(*) from users;"],
-    ).run
+  it "passes through arguments to heroku-cli with correct quoting" do
+    execute_command_with_quotable_arguments
 
     expect(Kernel).to have_received(:exec).with(*psql_count)
   end
 
-  it "returns `false` when a system command fails" do
-    allow(Kernel).to receive(:exec).with(*psql_count).and_return(nil)
+  describe "returned value" do
+    context "when the executed command does not explicitly return true" do
+      it "returns false" do
+        allow(Kernel).to receive(:exec).with(*psql_count).and_return(nil)
 
-    result = Parity::Environment.new(
-      "production",
-      ["pg:psql", "-c", "select count(*) from users;"],
-    ).run
+        result = execute_command_with_quotable_arguments
 
-    expect(result).to eq(false)
+        expect(result).to eq(false)
+      end
+    end
+
+    context "when deploy was successful with no pending migrations" do
+      it "returns true" do
+        stub_is_a_rails_app
+        stub_pending_migrations(true)
+
+        expect(deploy_to_production).to eq(true)
+      end
+    end
+
+    context "when deploy was not successful" do
+      it "returns false" do
+        stub_is_a_rails_app
+        allow(Kernel).to receive(:system).with(git_push).and_return(false)
+
+        expect(deploy_to_production).to eq(false)
+      end
+    end
   end
 
   it "backs up the database" do
@@ -35,7 +51,6 @@ RSpec.describe Parity::Environment do
   it "connects to the Heroku app when $PWD does not match the app name" do
     backup = stub_parity_backup
     stub_git_remote(base_name: "parity-integration", environment: "staging")
-    allow(Parity::Backup).to receive(:new).and_return(backup)
 
     Parity::Environment.new("staging", ["restore", "production"]).run
 
@@ -49,156 +64,140 @@ RSpec.describe Parity::Environment do
     expect(backup).to have_received(:restore)
   end
 
-  it "restores backups from production to staging" do
-    backup = stub_parity_backup
-    stub_git_remote(environment: "staging")
-    allow(Parity::Backup).to receive(:new).and_return(backup)
+  describe "database restores" do
+    it "restores backups from production to staging" do
+      backup = stub_parity_backup
+      stub_git_remote(environment: "staging")
 
-    Parity::Environment.new("staging", ["restore", "production"]).run
+      Parity::Environment.new("staging", ["restore", "production"]).run
 
-    expect(Parity::Backup).
-      to have_received(:new).
-      with(
-        from: "production",
-        to: "staging",
-        additional_args: "--confirm parity-staging",
+      expect(Parity::Backup).
+        to have_received(:new).
+        with(
+          from: "production",
+          to: "staging",
+          additional_args: "--confirm parity-staging",
+        )
+      expect(backup).to have_received(:restore)
+    end
+
+    it "restores using restore-from" do
+      backup = stub_parity_backup
+      stub_git_remote(environment: "staging")
+
+      Parity::Environment.new("staging", ["restore-from", "production"]).run
+
+      expect(Parity::Backup).
+        to have_received(:new).
+        with(
+          from: "production",
+          to: "staging",
+          additional_args: "--confirm parity-staging",
+        )
+      expect(backup).to have_received(:restore)
+    end
+
+    context "with a confirmation argument and a non-production environment" do
+      it "passes the confirm argument" do
+        backup = stub_parity_backup
+        stub_git_remote(environment: "staging")
+
+        Parity::Environment.new("staging", ["restore", "production"]).run
+
+        expect(Parity::Backup).to have_received(:new).
+          with(
+            from: "production",
+            to: "staging",
+            additional_args: "--confirm parity-staging",
+          )
+        expect(backup).to have_received(:restore)
+      end
+    end
+
+    it "restores backups from production to development" do
+      backup = stub_parity_backup
+
+      Parity::Environment.new("development", ["restore", "production"]).run
+
+      expect(Parity::Backup).to have_received(:new).
+        with(from: "production", to: "development", additional_args: "")
+      expect(backup).to have_received(:restore)
+    end
+
+    it "restores backups from staging to development" do
+      backup = stub_parity_backup
+
+      Parity::Environment.new("development", ["restore", "staging"]).run
+
+      expect(Parity::Backup).to have_received(:new).
+        with(from: "staging", to: "development", additional_args: "")
+      expect(backup).to have_received(:restore)
+    end
+
+    it "does not allow restoring backups into production" do
+      stub_parity_backup
+      stub_git_remote
+      allow($stdout).to receive(:puts)
+
+      Parity::Environment.new("production", ["restore", "staging"]).run
+
+      expect(Parity::Backup).not_to have_received(:new)
+      expect($stdout).to have_received(:puts).
+        with("Parity does not support restoring backups into your production "\
+            "environment. Use `--force` to override.")
+    end
+
+    it "restores backups into production if forced" do
+      backup = stub_parity_backup
+
+      Parity::Environment.new("production", ["restore", "staging", "--force"]).run
+
+      expect(Parity::Backup).to have_received(:new).
+        with(from: "staging", to: "production", additional_args: "--force")
+      expect(backup).to have_received(:restore)
+    end
+  end
+
+  describe "special commands" do
+    it "opens the remote console" do
+      Parity::Environment.new("production", ["console"]).run
+
+      expect(Kernel).to have_received(:system).with(heroku_console)
+    end
+
+    it "tails logs with any additional arguments" do
+      Parity::Environment.new("production", ["tail", "--ps", "web"]).run
+
+      expect(Kernel).to have_received(:system).with(tail)
+    end
+
+    it "opens a Redis session connected to the environment's Redis service" do
+      allow(Open3).to receive(:capture3).and_return(open3_redis_url_fetch_result)
+
+      Parity::Environment.new("production", ["redis_cli"]).run
+
+      expect(Kernel).to have_received(:system).with(
+        "redis-cli",
+        "-h",
+        "landshark.redistogo.com",
+        "-p",
+        "90210",
+        "-a",
+        "abcd1234efgh5678"
       )
-    expect(backup).to have_received(:restore)
-  end
-
-  it "restores using restore-from" do
-    backup = stub_parity_backup
-    stub_git_remote(environment: "staging")
-    allow(Parity::Backup).to receive(:new).and_return(backup)
-
-    Parity::Environment.new("staging", ["restore-from", "production"]).run
-
-    expect(Parity::Backup).
-      to have_received(:new).
-      with(
-        from: "production",
-        to: "staging",
-        additional_args: "--confirm parity-staging",
-      )
-    expect(backup).to have_received(:restore)
-  end
-
-  it "passes the confirm argument when restoring to a non-prod environment" do
-    backup = stub_parity_backup
-    stub_git_remote(environment: "staging")
-    allow(Parity::Backup).to receive(:new).and_return(backup)
-
-    Parity::Environment.new("staging", ["restore", "production"]).run
-
-    expect(Parity::Backup).to have_received(:new).
-      with(
-        from: "production",
-        to: "staging",
-        additional_args: "--confirm parity-staging",
-      )
-    expect(backup).to have_received(:restore)
-  end
-
-  it "restores backups from production to development" do
-    backup = stub_parity_backup
-    allow(Parity::Backup).to receive(:new).and_return(backup)
-
-    Parity::Environment.new("development", ["restore", "production"]).run
-
-    expect(Parity::Backup).to have_received(:new).
-      with(from: "production", to: "development", additional_args: "")
-    expect(backup).to have_received(:restore)
-  end
-
-  it "restores backups from staging to development" do
-    backup = stub_parity_backup
-    allow(Parity::Backup).to receive(:new).and_return(backup)
-
-    Parity::Environment.new("development", ["restore", "staging"]).run
-
-    expect(Parity::Backup).to have_received(:new).
-      with(from: "staging", to: "development", additional_args: "")
-    expect(backup).to have_received(:restore)
-  end
-
-  it "does not allow restoring backups into production" do
-    backup = stub_parity_backup
-    stub_git_remote
-    allow(Parity::Backup).to receive(:new).and_return(backup)
-    allow($stdout).to receive(:puts)
-
-    Parity::Environment.new("production", ["restore", "staging"]).run
-
-    expect(Parity::Backup).not_to have_received(:new)
-    expect($stdout).to have_received(:puts).
-      with("Parity does not support restoring backups into your production "\
-           "environment. Use `--force` to override.")
-  end
-
-  it "restores backups into production if forced" do
-    backup = stub_parity_backup
-    allow(Parity::Backup).to receive(:new).and_return(backup)
-
-    Parity::Environment.new("production", ["restore", "staging", "--force"]).run
-
-    expect(Parity::Backup).to have_received(:new).
-      with(from: "staging", to: "production", additional_args: "--force")
-    expect(backup).to have_received(:restore)
-  end
-
-  it "opens the remote console" do
-    Parity::Environment.new("production", ["console"]).run
-
-    expect(Kernel).to have_received(:system).with(heroku_console)
-  end
-
-  it "automatically restarts processes when it migrates the database" do
-    Parity::Environment.new("production", ["migrate"]).run
-
-    expect(Kernel).to have_received(:system).with(migrate)
-  end
-
-  it "tails logs with any additional arguments" do
-    Parity::Environment.new("production", ["tail", "--ps", "web"]).run
-
-    expect(Kernel).to have_received(:system).with(tail)
-  end
-
-  it "opens the app" do
-    Parity::Environment.new("production", ["open"]).run
-
-    expect(Kernel).to have_received(:exec).with(*open)
-  end
-
-  it "opens a Redis session connected to the environment's Redis service" do
-    allow(Open3).to receive(:capture3).and_return(open3_redis_url_fetch_result)
-
-    Parity::Environment.new("production", ["redis_cli"]).run
-
-    expect(Kernel).to have_received(:system).with(
-      "redis-cli",
-      "-h",
-      "landshark.redistogo.com",
-      "-p",
-      "90210",
-      "-a",
-      "abcd1234efgh5678"
-    )
-    expect(Open3).
-      to have_received(:capture3).
-      with(fetch_redis_url("REDIS_URL")).
-      once
+      expect(Open3).
+        to have_received(:capture3).
+        with(fetch_redis_url("REDIS_URL")).
+        once
+    end
   end
 
   describe "database migration on deploy" do
     it "deploys the application and runs migrations when required" do
       stub_is_a_rails_app
-      allow(Kernel).
-        to receive(:system).
-        with(check_for_no_pending_migrations).
-        and_return(false)
+      stub_pending_migrations(true)
 
-      Parity::Environment.new("production", ["deploy"]).run
+      deploy_to_production
 
       expect(Kernel).
         to have_received(:system).
@@ -210,26 +209,16 @@ RSpec.describe Parity::Environment do
 
     it "deploys the application and skips migrations when not required" do
       stub_is_a_rails_app
-      allow(Kernel).
-        to receive(:system).
-        with(check_for_no_pending_migrations).
-        and_return(true)
+      stub_pending_migrations(false)
 
-      Parity::Environment.new("production", ["deploy"]).run
-
-      expect(Kernel).to have_received(:system).with(git_push)
-      expect(Kernel).not_to have_received(:system).with(migrate)
+      it_does_not_run_migrations
     end
 
     context "when deploying to a non-production environment" do
       it "compares against HEAD to check for pending migrations" do
         stub_is_a_rails_app
-        allow(Kernel).
-          to receive(:system).
-          with(check_for_no_pending_migrations).
-          and_return(false)
 
-        Parity::Environment.new("staging", ["deploy"]).run
+        deploy_to_staging
 
         expect(Kernel).
           to have_received(:system).
@@ -241,64 +230,38 @@ RSpec.describe Parity::Environment do
           ).ordered
       end
     end
-  end
 
-  it "returns true if the deploy was succesful but no migrations needed to be run" do
-    stub_is_a_rails_app
-    allow(Kernel).
-      to receive(:system).
-      with(check_for_no_pending_migrations).
-      and_return(true)
+    context "when no db/migrate directory is present" do
+      it "does not run migrations" do
+        stub_migration_path_check(false)
+        stub_rakefile_check(true)
 
-    result = Parity::Environment.new("production", ["deploy"]).run
+        it_does_not_run_migrations
+      end
+    end
 
-    expect(result).to eq(true)
-  end
+    context "when the deploy fails" do
+      it "does not run migrations" do
+        stub_is_a_rails_app
+        stub_pending_migrations(true)
+        allow(Kernel).to receive(:system).with(git_push).and_return(false)
 
-  it "returns false if the deploy was not succesful" do
-    stub_is_a_rails_app
-    allow(Kernel).to receive(:system).with(git_push).and_return(false)
+        it_does_not_run_migrations
+      end
+    end
 
-    result = Parity::Environment.new("production", ["deploy"]).run
+    context "when no Rakefile is present" do
+      it "does not run migrations" do
+        stub_migration_path_check(true)
+        stub_rakefile_check(false)
 
-    expect(result).to eq(false)
-  end
-
-  it "does not run migrations if the deploy failed" do
-    stub_is_a_rails_app
-    allow(Kernel).
-      to receive(:system).
-      with(check_for_no_pending_migrations).
-      and_return(false)
-    allow(Kernel).to receive(:system).with(git_push).and_return(false)
-
-    Parity::Environment.new("production", ["deploy"]).run
-
-    expect(Kernel).not_to have_received(:system).with(migrate)
-  end
-
-  it "does not run migrations if no Rakefile is present" do
-    stub_migration_path_check(true)
-    stub_rakefile_check(false)
-
-    Parity::Environment.new("production", ["deploy"]).run
-
-    expect(Kernel).not_to have_received(:system).with(migrate)
-  end
-
-  it "does not run migrations if no db/migrate directory is present" do
-    path_stub = stub_migration_path_check(false)
-    stub_rakefile_check(true)
-
-    Parity::Environment.new("production", ["deploy"]).run
-
-    expect(path_stub).to have_received(:join).with("migrate").ordered
-    expect(path_stub).to have_received(:directory?).ordered
-    expect(Kernel).not_to have_received(:system).with(migrate)
+        it_does_not_run_migrations
+      end
+    end
   end
 
   it "deploys feature branches to staging's master for evaluation" do
-    Parity::Environment.new("staging", ["deploy"]).run
+    deploy_to_staging
 
     expect(Kernel).to have_received(:system).with(git_push_feature_branch)
   end
@@ -337,10 +300,6 @@ RSpec.describe Parity::Environment do
     "heroku logs --tail --ps web --remote production"
   end
 
-  def open
-    ["heroku", "open", "--remote", "production"]
-  end
-
   def redis_cli
     "redis-cli -h landshark.redistogo.com -p 90210 -a abcd1234efgh5678"
   end
@@ -359,8 +318,10 @@ RSpec.describe Parity::Environment do
 
   def psql_count
     [
-      "heroku", "pg:psql",
-      "-c", "select count(*) from users;",
+      "heroku",
+      "pg:psql",
+      "-c",
+      "select count(*) from users;",
       "--remote", "production"
     ]
   end
@@ -395,6 +356,41 @@ RSpec.describe Parity::Environment do
   end
 
   def stub_parity_backup
-    instance_double("Parity::Backup", restore: nil)
+    backup = instance_double(Parity::Backup, restore: nil)
+    allow(Parity::Backup).to receive(:new).and_return(backup)
+
+    backup
+  end
+
+  def it_does_not_run_migrations
+    deploy_to_production
+
+    expect(Kernel).not_to have_received(:system).with(migrate)
+  end
+
+  def deploy_to(environment)
+    Parity::Environment.new(environment, ["deploy"]).run
+  end
+
+  def deploy_to_production
+    deploy_to("production")
+  end
+
+  def deploy_to_staging
+    deploy_to("staging")
+  end
+
+  def stub_pending_migrations(result)
+    allow(Kernel).
+      to receive(:system).
+      with(check_for_no_pending_migrations).
+      and_return(!result)
+  end
+
+  def execute_command_with_quotable_arguments
+    Parity::Environment.new(
+      "production",
+      ["pg:psql", "-c", "select count(*) from users;"],
+    ).run
   end
 end
